@@ -4,14 +4,14 @@
  * Custom reliability protocol for real-time arena combat.
  * Runs on top of any transport (WebRTC DataChannel, WebSocket, etc.)
  *
- * Packet header (9 bytes):
+ * Packet header (10 bytes):
  *   Byte 0:    [MAGIC: 0xAC]
- *   Byte 1:    [channel:2b][flags:6b]
- *   Bytes 2-3: [sequence:u16]        — per-channel outgoing sequence
- *   Bytes 4-5: [ackSeq:u16]         — highest received seq from peer
- *   Bytes 6-9: [ackBitfield:u32]    — bit N = "I received (ackSeq - N)"
+ *   Byte 1:    [channel:2b (bits 7-6)][kind:2b (bits 5-4)][version:4b (bits 3-0)]
+ *   Bytes 2-3: [sequence:u16 LE]     — per-channel outgoing sequence
+ *   Bytes 4-5: [ackSeq:u16 LE]       — highest received seq from peer
+ *   Bytes 6-9: [ackBitfield:u32 LE]  — bit N = "I received (ackSeq - N - 1)"
  *
- * FEC packet (flag bit set):
+ * FEC packet (kind = FEC_PARITY):
  *   Same header, payload = XOR of previous N data packets in the group.
  *   Receiver can reconstruct any single lost packet from the group.
  *
@@ -22,8 +22,11 @@
 
 // ─── Constants ───────────────────────────────────────────────────
 
-export const ARCNET_VERSION = 2;
-export const ARCNET_HEADER_SIZE = 9;
+/** On-wire protocol version — bump on any breaking header change. */
+export const ARCNET_WIRE_VERSION = 1;
+/** Legacy alias — kept for any external consumer that imported it. */
+export const ARCNET_VERSION = ARCNET_WIRE_VERSION;
+export const ARCNET_HEADER_SIZE = 10;
 /** Magic byte to distinguish ARCnet packets from raw binary (0xAC = "AC"net) */
 export const ARCNET_MAGIC = 0xAC;
 
@@ -82,8 +85,9 @@ export interface ARCnetPacket {
 }
 
 /**
- * Encode: [magic:u8][byte1:u8][seq:u16][ackSeq:u16][ackBits:u32][payload:N]
- * Total: 9 + payload bytes
+ * Encode: [magic:u8][byte1:u8][seq:u16 LE][ackSeq:u16 LE][ackBits:u32 LE][payload:N]
+ * byte1 = [channel:2 (bits 7-6)][kind:2 (bits 5-4)][version:4 (bits 3-0)]
+ * Total: 10 + payload bytes
  */
 export function encodePacket(pkt: ARCnetPacket): ArrayBuffer {
   const size = ARCNET_HEADER_SIZE + pkt.payload.byteLength;
@@ -92,10 +96,14 @@ export function encodePacket(pkt: ARCnetPacket): ArrayBuffer {
   const bytes = new Uint8Array(buf);
 
   view.setUint8(0, ARCNET_MAGIC);
-  view.setUint8(1, ((pkt.channel & 0x3) << 6) | (pkt.flags & 0x3F));
+  view.setUint8(1,
+    ((pkt.channel & 0x3) << 6) |
+    ((pkt.flags & 0x3) << 4) |
+    (ARCNET_WIRE_VERSION & 0xF)
+  );
   view.setUint16(2, pkt.sequence, true);
   view.setUint16(4, pkt.ackSeq, true);
-  view.setUint32(5, pkt.ackBitfield >>> 0, true);
+  view.setUint32(6, pkt.ackBitfield >>> 0, true);
 
   if (pkt.payload.byteLength > 0) {
     bytes.set(new Uint8Array(pkt.payload), ARCNET_HEADER_SIZE);
@@ -105,7 +113,8 @@ export function encodePacket(pkt: ARCnetPacket): ArrayBuffer {
 }
 
 /**
- * Decode an ARCnet packet. Returns null if not a valid ARCnet packet.
+ * Decode an ARCnet packet. Returns null if not a valid ARCnet packet
+ * (bad magic, wrong version, or too short).
  */
 export function decodePacket(buf: ArrayBuffer): ARCnetPacket | null {
   if (buf.byteLength < ARCNET_HEADER_SIZE) return null;
@@ -114,11 +123,14 @@ export function decodePacket(buf: ArrayBuffer): ARCnetPacket | null {
   if (view.getUint8(0) !== ARCNET_MAGIC) return null;
 
   const byte1 = view.getUint8(1);
+  const version = byte1 & 0xF;
+  if (version !== ARCNET_WIRE_VERSION) return null;
+
   const channel = ((byte1 >> 6) & 0x3) as Channel;
-  const flags = (byte1 & 0x3F) as PacketFlags;
+  const flags = ((byte1 >> 4) & 0x3) as PacketFlags;
   const sequence = view.getUint16(2, true);
   const ackSeq = view.getUint16(4, true);
-  const ackBitfield = view.getUint32(5, true);
+  const ackBitfield = view.getUint32(6, true);
   const payload = buf.slice(ARCNET_HEADER_SIZE);
 
   return { channel, flags, sequence, ackSeq, ackBitfield, payload };

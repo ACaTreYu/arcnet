@@ -30,10 +30,8 @@ describe('constants', () => {
   it('batch magic is 0xAB', () => {
     expect(ARCNET_BATCH_MAGIC).toBe(0xAB);
   });
-  it('header size is documented as 9', () => {
-    // Will change to 10 in Step 1 — asserting current value so the
-    // Step 1 fix flips this intentionally.
-    expect(ARCNET_HEADER_SIZE).toBe(9);
+  it('header size is 10 bytes (post Step 1)', () => {
+    expect(ARCNET_HEADER_SIZE).toBe(10);
   });
 });
 
