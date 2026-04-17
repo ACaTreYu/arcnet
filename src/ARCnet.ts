@@ -180,140 +180,162 @@ export function unbatchPackets(data: ArrayBuffer): ArrayBuffer[] {
 
 // ─── FEC (Forward Error Correction) ─────────────────────────────
 //
-// XOR-based parity: every FEC_GROUP_SIZE data packets, emit 1 parity
-// packet whose payload = XOR of the group. If any single packet in
-// the group is lost, receiver XORs the parity with the received
-// packets to reconstruct the missing one.
+// XOR parity with explicit seq tagging. Every FEC_GROUP_SIZE data packets
+// the sender emits one parity packet whose payload carries:
+//
+//   [seq0:u16 LE][seq1:u16 LE][seq2:u16 LE]
+//   [xor of (u16 LE length + payload bytes) for each of the 3 packets,
+//    zero-padded to the max encoded length]
+//
+// The explicit seq tags make the protocol wrap-safe (no division by group
+// size) and let the receiver deliver the recovered packet under its TRUE
+// sequence number, not the parity's seq. The length-prefix preserves
+// original payload sizes when the group contains variable-length packets.
 
 /** Number of data packets per FEC group (parity emitted after each group) */
 const FEC_GROUP_SIZE = 3;
 
-/** XOR two ArrayBuffers of potentially different lengths (zero-pads shorter) */
-function xorBuffers(a: ArrayBuffer, b: ArrayBuffer): ArrayBuffer {
-  const maxLen = Math.max(a.byteLength, b.byteLength);
-  const result = new Uint8Array(maxLen);
-  const aBytes = new Uint8Array(a);
-  const bBytes = new Uint8Array(b);
-  for (let i = 0; i < maxLen; i++) {
-    result[i] = (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0);
-  }
-  return result.buffer as ArrayBuffer;
-}
+/** Size in bytes of the seq-tag prefix at the start of a parity payload */
+const FEC_PARITY_HEADER_SIZE = 2 * FEC_GROUP_SIZE;
 
-interface FECGroupEntry {
-  seq: number;
+/** Result of a successful FEC recovery — the missing packet's seq and its full payload. */
+export interface FECRecovery {
+  missingSeq: number;
   payload: ArrayBuffer;
 }
 
-/** Sender-side FEC: accumulates packets and produces parity */
-class FECSender {
-  private group: FECGroupEntry[] = [];
+/**
+ * XOR a length-prefixed representation of `payload` into `xor[offset..]`.
+ * Format: [u16 LE length][payload bytes]. Does NOT extend `xor` — caller must
+ * size it to the max encoded length of the group.
+ */
+function xorEncodedInto(xor: Uint8Array, offset: number, payload: ArrayBuffer): void {
+  const len = payload.byteLength;
+  xor[offset] ^= len & 0xFF;
+  xor[offset + 1] ^= (len >> 8) & 0xFF;
+  const src = new Uint8Array(payload);
+  for (let i = 0; i < src.length; i++) {
+    xor[offset + 2 + i] ^= src[i];
+  }
+}
 
-  /** Add a data packet to the current group. Returns parity payload if group is complete. */
+/** Sender-side FEC: accumulates packets and emits a seq-tagged length-prefixed XOR parity. */
+class FECSender {
+  private group: Array<{ seq: number; payload: ArrayBuffer }> = [];
+
+  /**
+   * Add a data packet to the current group. When the group is full, returns the
+   * parity payload: [seq0][seq1][seq2][XOR of (u16 len + payload) each].
+   */
   addPacket(seq: number, payload: ArrayBuffer): ArrayBuffer | null {
     this.group.push({ seq, payload });
-    if (this.group.length >= FEC_GROUP_SIZE) {
-      // XOR all payloads in the group
-      let parity = this.group[0].payload;
-      for (let i = 1; i < this.group.length; i++) {
-        parity = xorBuffers(parity, this.group[i].payload);
-      }
-      this.group = [];
-      return parity;
+    if (this.group.length < FEC_GROUP_SIZE) return null;
+
+    let maxEncoded = 0;
+    for (const e of this.group) maxEncoded = Math.max(maxEncoded, 2 + e.payload.byteLength);
+
+    const parity = new Uint8Array(FEC_PARITY_HEADER_SIZE + maxEncoded);
+    const view = new DataView(parity.buffer);
+
+    for (let i = 0; i < FEC_GROUP_SIZE; i++) {
+      view.setUint16(i * 2, this.group[i].seq, true);
     }
-    return null;
+    for (const e of this.group) {
+      xorEncodedInto(parity, FEC_PARITY_HEADER_SIZE, e.payload);
+    }
+
+    this.group = [];
+    return parity.buffer as ArrayBuffer;
   }
 
   reset(): void { this.group = []; }
 }
 
-/** Receiver-side FEC: tracks received packets per group, reconstructs on loss */
+/**
+ * Receiver-side FEC: stores recent data packets and pending parities. Recovers a
+ * single missing packet per parity once all other packets in the group are known.
+ * Parities may arrive before or after any of their data packets — either direction
+ * triggers recovery when the "exactly one missing" condition is met.
+ */
 class FECReceiver {
-  // Group tracking: group index → received packets + parity
-  private groups: Map<number, {
-    received: Map<number, ArrayBuffer>; // seq → payload
-    parity: ArrayBuffer | null;
-    startSeq: number;
-  }> = new Map();
+  /** Max recent data packets kept (FIFO eviction by insertion order). */
+  private static readonly MAX_DATA = 256;
+  /** Max pending parities (FIFO eviction — old parities whose group never completes). */
+  private static readonly MAX_PARITIES = 32;
 
-  /** Get the group index for a sequence number */
-  private groupIndex(seq: number): number {
-    return Math.floor(seq / FEC_GROUP_SIZE);
-  }
+  private receivedData: Map<number, ArrayBuffer> = new Map();
+  private pendingParities: Array<{ seqs: number[]; xor: Uint8Array }> = [];
 
-  /** Record a received data packet. Returns reconstructed payload if FEC recovery happened. */
-  addDataPacket(seq: number, payload: ArrayBuffer): ArrayBuffer | null {
-    const gi = this.groupIndex(seq);
-    let group = this.groups.get(gi);
-    if (!group) {
-      group = { received: new Map(), parity: null, startSeq: gi * FEC_GROUP_SIZE };
-      this.groups.set(gi, group);
-    }
-    group.received.set(seq, payload);
-    return this.tryRecover(gi);
-  }
-
-  /** Record a received parity packet. Returns reconstructed payload if FEC recovery happened. */
-  addParityPacket(seq: number, parityPayload: ArrayBuffer): ArrayBuffer | null {
-    const gi = this.groupIndex(seq);
-    let group = this.groups.get(gi);
-    if (!group) {
-      group = { received: new Map(), parity: null, startSeq: gi * FEC_GROUP_SIZE };
-      this.groups.set(gi, group);
-    }
-    group.parity = parityPayload;
-    return this.tryRecover(gi);
-  }
-
-  /** Try to recover a missing packet. Returns recovered payload or null. */
-  private tryRecover(gi: number): ArrayBuffer | null {
-    const group = this.groups.get(gi);
-    if (!group || !group.parity) return null;
-
-    // Count how many data packets we're missing
-    const expectedSeqs: number[] = [];
-    for (let i = 0; i < FEC_GROUP_SIZE; i++) {
-      expectedSeqs.push((group.startSeq + i) % SEQ_MAX);
+  /** Record a received data packet. Returns a recovery if this arrival completes a pending parity. */
+  addDataPacket(seq: number, payload: ArrayBuffer): FECRecovery | null {
+    this.receivedData.set(seq, payload);
+    while (this.receivedData.size > FECReceiver.MAX_DATA) {
+      const first = this.receivedData.keys().next().value;
+      if (first === undefined) break;
+      this.receivedData.delete(first);
     }
 
-    const missing: number[] = [];
-    for (const seq of expectedSeqs) {
-      if (!group.received.has(seq)) missing.push(seq);
-    }
-
-    if (missing.length === 1) {
-      // Can recover! XOR parity with all received packets
-      let recovered = group.parity;
-      for (const [, payload] of group.received) {
-        recovered = xorBuffers(recovered, payload);
+    for (let i = 0; i < this.pendingParities.length; i++) {
+      const p = this.pendingParities[i];
+      if (!p.seqs.includes(seq)) continue;
+      const recovery = this.tryRecover(p);
+      if (recovery) {
+        this.pendingParities.splice(i, 1);
+        return recovery;
       }
-      // Clean up group
-      this.groups.delete(gi);
-      return recovered;
     }
-
-    if (missing.length === 0) {
-      // All received, no recovery needed — clean up
-      this.groups.delete(gi);
-    }
-
     return null;
   }
 
-  /** Prune old groups to prevent unbounded growth */
-  prune(currentSeq: number): void {
-    const currentGroup = this.groupIndex(currentSeq);
-    const maxGroups = Math.floor(SEQ_MAX / FEC_GROUP_SIZE); // 21845 for u16
-    for (const gi of this.groups.keys()) {
-      // Modular distance handles u16 sequence wrap-around
-      const age = ((currentGroup - gi + maxGroups) % maxGroups);
-      if (age > 8) {
-        this.groups.delete(gi);
-      }
+  /** Record a parity packet. Returns a recovery if exactly one of its three seqs is missing. */
+  addParityPacket(parityPayload: ArrayBuffer): FECRecovery | null {
+    if (parityPayload.byteLength < FEC_PARITY_HEADER_SIZE) return null;
+
+    const view = new DataView(parityPayload);
+    const seqs: number[] = [];
+    for (let i = 0; i < FEC_GROUP_SIZE; i++) {
+      seqs.push(view.getUint16(i * 2, true));
     }
+    const xor = new Uint8Array(parityPayload.slice(FEC_PARITY_HEADER_SIZE));
+    const parity = { seqs, xor };
+
+    const recovery = this.tryRecover(parity);
+    if (recovery) return recovery;
+
+    this.pendingParities.push(parity);
+    while (this.pendingParities.length > FECReceiver.MAX_PARITIES) {
+      this.pendingParities.shift();
+    }
+    return null;
   }
 
-  reset(): void { this.groups.clear(); }
+  private tryRecover(parity: { seqs: number[]; xor: Uint8Array }): FECRecovery | null {
+    const missing: number[] = [];
+    const present: ArrayBuffer[] = [];
+    for (const s of parity.seqs) {
+      const p = this.receivedData.get(s);
+      if (p === undefined) missing.push(s);
+      else present.push(p);
+    }
+    if (missing.length !== 1) return null;
+
+    const work = new Uint8Array(parity.xor); // copy — don't mutate the stored parity
+    for (const p of present) {
+      xorEncodedInto(work, 0, p);
+    }
+
+    if (work.length < 2) return null;
+    const recoveredLen = work[0] | (work[1] << 8);
+    if (recoveredLen > work.length - 2) return null; // corrupt length prefix
+
+    const payload = work.slice(2, 2 + recoveredLen).buffer as ArrayBuffer;
+    return { missingSeq: missing[0], payload };
+  }
+
+  reset(): void {
+    this.receivedData.clear();
+    this.pendingParities = [];
+  }
 }
 
 // ─── Congestion Control ──────────────────────────────────────────
@@ -562,9 +584,14 @@ class ChannelState {
   }
 
   /**
-   * Process incoming sequence. Returns payloads to deliver (may be empty if stale/dup).
+   * Process an incoming sequence. Returns payloads to deliver (may be empty if
+   * stale/dup). When `fromFEC=true`, the payload is an FEC-recovered packet —
+   * SEQUENCED staleness is bypassed so the app can reconcile via its own
+   * sequence scheme, and latestReceivedSeq is not regressed.
+   *
+   * FEC ingestion for data packets is now handled at the session level, not here.
    */
-  receiveSeq(seq: number, payload: ArrayBuffer): ArrayBuffer[] {
+  receiveSeq(seq: number, payload: ArrayBuffer, fromFEC: boolean = false): ArrayBuffer[] {
     // Update ACK state
     if (!this.hasReceivedAny) {
       this.hasReceivedAny = true;
@@ -585,21 +612,19 @@ class ChannelState {
       }
     }
 
-    // FEC: track received data packet for potential recovery
-    if (this.fecEnabled) {
-      this.fecReceiver.addDataPacket(seq, payload);
-    }
-
     switch (this.channel) {
       case Channel.CRITICAL:
         return this.deliverOrdered(seq, payload);
       case Channel.RELIABLE:
         return [payload]; // unordered, deliver immediately
       case Channel.SEQUENCED:
-        if (this.hasReceivedAny && !seqNewer(seq, this.latestReceivedSeq) && seq !== this.latestReceivedSeq) {
-          return []; // stale
+        if (!fromFEC) {
+          if (!seqNewer(seq, this.latestReceivedSeq) && seq !== this.latestReceivedSeq) {
+            return []; // stale
+          }
+          this.latestReceivedSeq = seq;
         }
-        this.latestReceivedSeq = seq;
+        // fromFEC path: deliver regardless of staleness; leave latestReceivedSeq alone
         return [payload];
       case Channel.VOLATILE:
         return [payload];
@@ -607,13 +632,12 @@ class ChannelState {
     return [payload];
   }
 
-  /** Process an FEC parity packet. Returns recovered payload or null. */
-  receiveFECParity(seq: number, parityPayload: ArrayBuffer): ArrayBuffer | null {
-    if (!this.fecEnabled) return null;
-    return this.fecReceiver.addParityPacket(seq, parityPayload);
-  }
-
   private deliverOrdered(seq: number, payload: ArrayBuffer): ArrayBuffer[] {
+    // Skip already-delivered duplicates (seq strictly older than nextDeliverSeq).
+    // On first-ever receive nextDeliverSeq was just set to seq, so this is a no-op there.
+    if (!seqNewer(seq, this.nextDeliverSeq) && seq !== this.nextDeliverSeq) {
+      return [];
+    }
     this.deliveryQueue.set(seq, payload);
     const delivered: ArrayBuffer[] = [];
     while (this.deliveryQueue.has(this.nextDeliverSeq)) {
@@ -621,7 +645,8 @@ class ChannelState {
       this.deliveryQueue.delete(this.nextDeliverSeq);
       this.nextDeliverSeq = seqNext(this.nextDeliverSeq);
     }
-    // Don't let delivery queue grow unbounded (gap too large = skip ahead)
+    // Don't let delivery queue grow unbounded (gap too large = skip ahead).
+    // Step 5 replaces the numeric comparator with a wrap-aware one.
     if (this.deliveryQueue.size > 32) {
       const seqs = [...this.deliveryQueue.keys()].sort((a, b) => a - b);
       for (const s of seqs) {
@@ -641,10 +666,6 @@ class ChannelState {
 
   getRTT(): number { return this.srtt; }
   getPendingCount(): number { return this.pending.size; }
-
-  pruneReceiverFEC(): void {
-    if (this.fecEnabled) this.fecReceiver.prune(this.inHighest);
-  }
 }
 
 // ─── ARCnet Session ──────────────────────────────────────────────
@@ -670,10 +691,23 @@ export interface ARCnetStats {
   snapshotInterval: number;
 }
 
+/** Optional configuration for an ARCnetSession. */
+export interface ARCnetSessionOptions {
+  /**
+   * Per-channel FEC enable, indexed by Channel enum value.
+   * Defaults to [CRITICAL=false, RELIABLE=true, SEQUENCED=true, VOLATILE=false].
+   * Enabling FEC on CRITICAL adds instant-recovery on top of retransmit for
+   * single-packet losses — useful for low-volume, latency-sensitive events.
+   */
+  fec?: [boolean, boolean, boolean, boolean];
+}
+
+const DEFAULT_FEC: [boolean, boolean, boolean, boolean] = [false, true, true, false];
+
 export class ARCnetSession {
   private channels: ChannelState[];
   private congestion: CongestionController;
-  private _fecRecoveries: number = 0;
+  private readonly fecConfig: [boolean, boolean, boolean, boolean];
   private stats: ARCnetStats = {
     rtt: 80, packetsSent: 0, packetsReceived: 0,
     retransmits: 0, bytesSent: 0, bytesReceived: 0,
@@ -681,14 +715,19 @@ export class ARCnetSession {
     estimatedBandwidth: 50000, goodputBps: 0, snapshotInterval: 30,
   };
 
-  constructor() {
-    this.channels = [
-      new ChannelState(Channel.CRITICAL, false),    // ordered — FEC not useful (retransmit handles it)
-      new ChannelState(Channel.RELIABLE, true),      // FEC on — fire events, instant recovery
-      new ChannelState(Channel.SEQUENCED, true),     // FEC on — snapshots/input, smooth out hitches
-      new ChannelState(Channel.VOLATILE, false),     // fire & forget — no FEC needed
-    ];
+  constructor(options?: ARCnetSessionOptions) {
+    this.fecConfig = options?.fec ?? DEFAULT_FEC;
+    this.channels = this.buildChannels();
     this.congestion = new CongestionController();
+  }
+
+  private buildChannels(): ChannelState[] {
+    return [
+      new ChannelState(Channel.CRITICAL, this.fecConfig[0]),
+      new ChannelState(Channel.RELIABLE, this.fecConfig[1]),
+      new ChannelState(Channel.SEQUENCED, this.fecConfig[2]),
+      new ChannelState(Channel.VOLATILE, this.fecConfig[3]),
+    ];
   }
 
   /**
@@ -750,8 +789,9 @@ export class ARCnetSession {
 
   /**
    * Process received ARCnet packet.
-   * Returns delivered payloads (may be 0 if stale, or >1 if ordered queue flushed).
-   * Returns null if not a valid ARCnet packet (caller should handle as raw).
+   * Returns delivered payloads (may be 0 if stale, or >1 if ordered queue flushed
+   * or an FEC recovery runs piggyback). Returns null if not a valid ARCnet packet
+   * (caller should handle as raw).
    */
   receive(buf: ArrayBuffer): Array<{ channel: Channel; payload: ArrayBuffer }> | null {
     const pkt = decodePacket(buf);
@@ -767,21 +807,37 @@ export class ARCnetSession {
     const { rttSample } = ch.processAcks(pkt.ackSeq, pkt.ackBitfield, now);
     this.congestion.recordAck(rttSample, buf.byteLength);
 
-    // Handle FEC parity packets
+    const results: Array<{ channel: Channel; payload: ArrayBuffer }> = [];
+
+    // FEC parity packet — may recover a single missing data packet in its group
     if (pkt.flags === PacketFlags.FEC_PARITY) {
-      const recovered = ch.receiveFECParity(pkt.sequence, pkt.payload);
-      if (recovered) {
-        this._fecRecoveries++;
-        // Deliver the recovered payload through the channel state machine
-        const payloads = ch.receiveSeq(pkt.sequence, recovered);
-        return payloads.map(p => ({ channel: pkt.channel, payload: p }));
+      if (ch.hasFEC) {
+        const recovered = ch.fecReceiver.addParityPacket(pkt.payload);
+        if (recovered) {
+          this.stats.fecRecoveries++;
+          const payloads = ch.receiveSeq(recovered.missingSeq, recovered.payload, true);
+          for (const p of payloads) results.push({ channel: pkt.channel, payload: p });
+        }
       }
-      return []; // parity received but no recovery needed yet
+      return results;
     }
 
-    // Deliver payload through channel state machine
-    const payloads = ch.receiveSeq(pkt.sequence, pkt.payload);
-    return payloads.map(p => ({ channel: pkt.channel, payload: p }));
+    // Normal data packet — deliver via the channel state machine
+    const payloads = ch.receiveSeq(pkt.sequence, pkt.payload, false);
+    for (const p of payloads) results.push({ channel: pkt.channel, payload: p });
+
+    // Track this data packet in the FEC receiver; if it completes a pending
+    // parity's group, we get a recovery to deliver alongside.
+    if (ch.hasFEC) {
+      const recovered = ch.fecReceiver.addDataPacket(pkt.sequence, pkt.payload);
+      if (recovered) {
+        this.stats.fecRecoveries++;
+        const payloads = ch.receiveSeq(recovered.missingSeq, recovered.payload, true);
+        for (const p of payloads) results.push({ channel: pkt.channel, payload: p });
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -803,18 +859,15 @@ export class ARCnetSession {
         this.stats.retransmits++;
         this.stats.bytesSent += encoded.byteLength;
       }
-      // Prune old FEC receiver groups
-      ch.pruneReceiverFEC();
     }
 
     // Evaluate congestion
     this.congestion.evaluate(now);
 
-    // Update stats
+    // Update stats (fecRecoveries is incremented inline in receive())
     this.stats.rtt = this.channels[Channel.RELIABLE].getRTT();
     this.stats.lossRate = this.congestion.lossRate;
     this.stats.quality = this.congestion.quality;
-    this.stats.fecRecoveries = this._fecRecoveries;
     this.stats.estimatedBandwidth = this.congestion.estimatedBandwidth;
     this.stats.goodputBps = this.congestion.goodputBps;
     this.stats.snapshotInterval = this.congestion.snapshotInterval;
@@ -828,13 +881,8 @@ export class ARCnetSession {
   getStats(): ARCnetStats { return { ...this.stats }; }
 
   reset(): void {
-    this.channels = [
-      new ChannelState(Channel.CRITICAL, false),
-      new ChannelState(Channel.RELIABLE, true),
-      new ChannelState(Channel.SEQUENCED, true),
-      new ChannelState(Channel.VOLATILE, false),
-    ];
+    this.channels = this.buildChannels();
     this.congestion.reset();
-    this._fecRecoveries = 0;
+    this.stats.fecRecoveries = 0;
   }
 }
