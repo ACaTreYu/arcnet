@@ -10,14 +10,12 @@ import { describe, it, expect } from 'vitest';
 import {
   ARCNET_MAGIC,
   ARCNET_HEADER_SIZE,
-  ARCNET_BATCH_MAGIC,
   Channel,
   PacketFlags,
   QualityTier,
   encodePacket,
   decodePacket,
   isARCnetPacket,
-  isBatchedPacket,
   ARCnetSession,
 } from '../src/ARCnet';
 
@@ -26,9 +24,6 @@ import {
 describe('constants', () => {
   it('magic byte is 0xAC', () => {
     expect(ARCNET_MAGIC).toBe(0xAC);
-  });
-  it('batch magic is 0xAB', () => {
-    expect(ARCNET_BATCH_MAGIC).toBe(0xAB);
   });
   it('header size is 10 bytes (post Step 1)', () => {
     expect(ARCNET_HEADER_SIZE).toBe(10);
@@ -105,17 +100,6 @@ describe('packet detection helpers', () => {
     expect(isARCnetPacket(encoded)).toBe(true);
   });
 
-  it('isBatchedPacket false on framed packet', () => {
-    const encoded = encodePacket({
-      channel: Channel.RELIABLE,
-      flags: PacketFlags.NORMAL,
-      sequence: 0,
-      ackSeq: 0,
-      ackBitfield: 0,
-      payload: new ArrayBuffer(0),
-    });
-    expect(isBatchedPacket(encoded)).toBe(false);
-  });
 });
 
 // ─── End-to-end session happy path ─────────────────────────────────

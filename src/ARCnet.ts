@@ -144,40 +144,6 @@ export function isARCnetPacket(data: ArrayBuffer | Buffer | Uint8Array): boolean
   return first === ARCNET_MAGIC;
 }
 
-// ─── Packet Coalescence ─────────────────────────────────────────
-//
-// Multiple ARCnet packets batched into one DataChannel send.
-// Reduces per-packet DTLS/SCTP overhead (~20-40 bytes per send).
-// Format: [0xAB magic][u16 len][packet...][u16 len][packet...]...
-
-/** Magic byte for coalesced/batched packet bundles */
-export const ARCNET_BATCH_MAGIC = 0xAB;
-
-/** Check if a buffer is a coalesced batch */
-export function isBatchedPacket(data: ArrayBuffer | Buffer | Uint8Array): boolean {
-  if (data.byteLength < 4) return false; // magic + at least one u16 len + 1 byte
-  const first = data instanceof ArrayBuffer ? new Uint8Array(data)[0]
-    : (data as any)[0];
-  return first === ARCNET_BATCH_MAGIC;
-}
-
-/** Split a coalesced batch into individual packet buffers */
-export function unbatchPackets(data: ArrayBuffer): ArrayBuffer[] {
-  const view = new DataView(data);
-  if (view.getUint8(0) !== ARCNET_BATCH_MAGIC) return [data]; // not batched
-
-  const result: ArrayBuffer[] = [];
-  let offset = 1; // skip magic
-  while (offset + 2 <= data.byteLength) {
-    const len = view.getUint16(offset, true);
-    offset += 2;
-    if (offset + len > data.byteLength) break; // truncated
-    result.push(data.slice(offset, offset + len));
-    offset += len;
-  }
-  return result;
-}
-
 // ─── FEC (Forward Error Correction) ─────────────────────────────
 //
 // XOR parity with explicit seq tagging. Every FEC_GROUP_SIZE data packets
