@@ -1,6 +1,6 @@
 # ARCnet
 
-**Custom reliability protocol for real-time arena combat.**
+**Custom reliability protocol for real-time multiplayer combat.**
 
 A tiny, transport-agnostic protocol layer that gives you sequencing, selective-ACK retransmit, forward-error correction, and adaptive congestion control — on top of anything that moves bytes (WebRTC DataChannels, WebSockets, raw UDP).
 
@@ -14,21 +14,33 @@ Built for and battle-tested in the [Arcbound game](https://arcboundinteractive.c
 | Lost packets | Selective-ACK bitfield + per-channel retransmit |
 | Bursty loss | XOR-based forward error correction (one recovery packet per N data packets) |
 | Congestion | Loss/RTT monitoring → `GOOD`/`FAIR`/`POOR` quality tier callers can throttle on |
-| Channel contention | Separate sequence spaces per channel (input, state, chat, etc.) |
+| Channel contention | Separate sequence spaces per channel (critical, reliable, sequenced, volatile) |
 
 ## Packet format
 
-9-byte header:
+10-byte header:
 
 ```
-Byte 0:    [MAGIC: 0xAC]
-Byte 1:    [channel:2b][flags:6b]
-Bytes 2-3: [sequence:u16]       — per-channel outgoing sequence
-Bytes 4-5: [ackSeq:u16]         — highest received seq from peer
-Bytes 6-9: [ackBitfield:u32]    — bit N = "I received (ackSeq - N)"
+Byte 0     : [MAGIC: 0xAC]
+Byte 1     : [channel:2b (bits 7-6)][kind:2b (bits 5-4)][version:4b (bits 3-0)]
+Bytes 2-3  : [sequence:u16 LE]       — per-channel outgoing sequence
+Bytes 4-5  : [ackSeq:u16 LE]         — highest received seq from peer
+Bytes 6-9  : [ackBitfield:u32 LE]    — bit N = "I received (ackSeq − N − 1)"
 ```
 
-FEC packets set a flag bit; their payload is the XOR of the previous N data packets in the group. The receiver can reconstruct any single lost packet from that group without a round trip.
+The version nibble in byte 1 lets decoders reject unknown wire formats cleanly (current wire version: `1`).
+
+### FEC packet payload
+
+When `kind = FEC_PARITY`, the packet payload carries:
+
+```
+Bytes 0-5  : [seq0:u16 LE][seq1:u16 LE][seq2:u16 LE]   — seqs covered by this parity
+Bytes 6+   : XOR of (u16 LE length + payload) for each of the three data packets,
+             zero-padded to the max encoded length in the group
+```
+
+Seq tags make recovery wrap-safe and let the receiver deliver the recovered packet under its true sequence number. Length-prefixing preserves original payload sizes when the group contains variable-length packets.
 
 ## Files
 
@@ -40,35 +52,57 @@ FEC packets set a flag bit; their payload is the XOR of the previous N data pack
 ARCnet is transport-agnostic. You wire it to whatever channel you have:
 
 ```ts
-import { ARCnetPeer } from 'arcnet';
+import { ARCnetSession, Channel, QualityTier } from 'arcnet';
 
-const peer = new ARCnetPeer({
-  send: (bytes) => webrtcChannel.send(bytes),
-  onReceive: (channel, bytes) => handleMessage(channel, bytes),
-});
+const session = new ARCnetSession();
 
 // Incoming bytes from the transport:
-webrtcChannel.onmessage = (e) => peer.ingest(new Uint8Array(e.data));
+webrtcChannel.onmessage = (e) => {
+  const delivered = session.receive(e.data);
+  if (delivered) {
+    for (const { channel, payload } of delivered) {
+      handleMessage(channel, payload);
+    }
+  }
+};
 
-// Send on a channel:
-peer.send(Channel.INPUT, payload);
+// Send on a channel — returns an array of buffers (data + optional FEC parity):
+for (const buf of session.send(Channel.SEQUENCED, payload)) {
+  webrtcChannel.send(buf);
+}
+
+// Tick periodically to flush retransmits and evaluate congestion:
+setInterval(() => {
+  for (const buf of session.tick(Date.now())) webrtcChannel.send(buf);
+}, 50);
 
 // Check congestion:
-if (peer.quality === 'POOR') throttleSnapshots();
+if (session.getQuality() === QualityTier.POOR) throttleSnapshots();
+
+// Or use the continuously adaptive snapshot interval:
+const intervalMs = session.getStats().snapshotInterval; // 30–90 ms
+```
+
+Optional config — enable FEC per channel. Defaults: `[CRITICAL=false, RELIABLE=true, SEQUENCED=true, VOLATILE=false]`.
+
+```ts
+const session = new ARCnetSession({ fec: [true, true, true, false] });
 ```
 
 (Public API described in `src/ARCnet.ts` — see the exports.)
 
-## Build
+## Build and test
 
 ```bash
 npm install
-npm run build     # emits dist/ via tsc
+npm run build       # emits dist/ via tsc
+npm test            # vitest run — round-trip, FEC, wrap, congestion
+npm run typecheck   # tsc --noEmit
 ```
 
 ## Status
 
-- **v3** — FEC, congestion tiers, field-level deltas (Apr 2026)
+- **v3** — FEC (seq-tagged, length-prefixed), adaptive snapshot interval, wrap-safe header v1 (Apr 2026)
 - v2 — UDP protocol, snapshot interpolation
 - v1 — basic framing + ACKs
 
