@@ -128,13 +128,17 @@ function makeLink() {
   const deliveredToA: Array<{ channel: Channel; payload: Uint8Array }> = [];
   const deliveredToB: Array<{ channel: Channel; payload: Uint8Array }> = [];
 
-  const fromAtoB = (buf: ArrayBuffer) => {
-    const out = b.receive(buf);
-    if (out) for (const d of out) deliveredToB.push({ channel: d.channel, payload: new Uint8Array(d.payload) });
+  const fromAtoB = (bufs: ArrayBuffer[]) => {
+    for (const buf of bufs) {
+      const out = b.receive(buf);
+      if (out) for (const d of out) deliveredToB.push({ channel: d.channel, payload: new Uint8Array(d.payload) });
+    }
   };
-  const fromBtoA = (buf: ArrayBuffer) => {
-    const out = a.receive(buf);
-    if (out) for (const d of out) deliveredToA.push({ channel: d.channel, payload: new Uint8Array(d.payload) });
+  const fromBtoA = (bufs: ArrayBuffer[]) => {
+    for (const buf of bufs) {
+      const out = a.receive(buf);
+      if (out) for (const d of out) deliveredToA.push({ channel: d.channel, payload: new Uint8Array(d.payload) });
+    }
   };
 
   return { a, b, fromAtoB, fromBtoA, deliveredToA, deliveredToB };

@@ -731,10 +731,19 @@ export class ARCnetSession {
   }
 
   /**
-   * Wrap payload in ARCnet framing for a given channel.
-   * Returns array of encoded packets to send (1 data + optional 1 FEC parity).
+   * Wrap a payload in ARCnet framing for a given channel.
+   *
+   * Returns an array of encoded packets the caller must hand to its transport:
+   *   - `[data]`                  for non-FEC channels, or for FEC channels when
+   *                               the current group is not yet full.
+   *   - `[data, parity]`          on the packet that completes an FEC group
+   *                               (every FEC_GROUP_SIZE-th send on an FEC channel).
+   *
+   * Parity packets carry the seqs of all members of their group in the payload,
+   * so their own header `sequence` is set to the last data seq in the group
+   * purely for diagnostic continuity; recovery does not depend on it.
    */
-  sendWithFEC(channel: Channel, payload: ArrayBuffer): ArrayBuffer[] {
+  send(channel: Channel, payload: ArrayBuffer): ArrayBuffer[] {
     const ch = this.channels[channel];
     const seq = ch.getNextSeq();
     const { ackSeq, ackBitfield } = ch.getAckState();
@@ -752,14 +761,12 @@ export class ARCnetSession {
     this.stats.packetsSent++;
     this.stats.bytesSent += dataPkt.byteLength;
 
-    // FEC: accumulate and emit parity when group is full
     if (ch.hasFEC) {
       const parityPayload = ch.fecSender.addPacket(seq, payload);
       if (parityPayload) {
         const parityPkt = encodePacket({
           channel, flags: PacketFlags.FEC_PARITY,
-          sequence: seq, // parity tagged with last seq in group
-          ackSeq, ackBitfield,
+          sequence: seq, ackSeq, ackBitfield,
           payload: parityPayload,
         });
         result.push(parityPkt);
@@ -770,22 +777,6 @@ export class ARCnetSession {
 
     return result;
   }
-
-  /**
-   * Wrap payload in ARCnet framing for a given channel.
-   * Returns single encoded ArrayBuffer ready to send.
-   * (Convenience method — does NOT emit FEC. Use sendWithFEC for FEC support.)
-   */
-  send(channel: Channel, payload: ArrayBuffer): ArrayBuffer {
-    const packets = this.sendWithFEC(channel, payload);
-    // Return only the data packet — FEC parity packets need separate sending
-    return packets[0];
-  }
-
-  /**
-   * Get any additional packets from the last send (FEC parity).
-   * Call after send() to get parity packets that also need sending.
-   */
 
   /**
    * Process received ARCnet packet.
