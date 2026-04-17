@@ -664,9 +664,14 @@ class ChannelState {
       this.nextDeliverSeq = seqNext(this.nextDeliverSeq);
     }
     // Don't let delivery queue grow unbounded (gap too large = skip ahead).
-    // Step 5 replaces the numeric comparator with a wrap-aware one.
+    // Sort is anchored on nextDeliverSeq so modular ordering is preserved
+    // across the u16 wrap boundary — a naive `a - b` comparator puts seq=0
+    // after seq=65535 when they should be adjacent.
     if (this.deliveryQueue.size > 32) {
-      const seqs = [...this.deliveryQueue.keys()].sort((a, b) => a - b);
+      const anchor = this.nextDeliverSeq;
+      const seqs = [...this.deliveryQueue.keys()].sort(
+        (a, b) => ((a - anchor + SEQ_MAX) % SEQ_MAX) - ((b - anchor + SEQ_MAX) % SEQ_MAX)
+      );
       for (const s of seqs) {
         delivered.push(this.deliveryQueue.get(s)!);
       }
