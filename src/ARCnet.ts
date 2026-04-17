@@ -380,17 +380,30 @@ class CongestionController {
     this.windowBytesSent += bytes;
   }
 
-  /** Record an ACK was received */
-  recordAck(rttSample?: number, bytes: number = 0): void {
-    this.ackCount++;
-    this.windowAcked++;
-    this.windowBytesAcked += bytes;
+  /**
+   * Record peer ACKs for a batch of previously-sent packets.
+   * Feed the count of pending packets actually cleared in this receive cycle
+   * (returned by ChannelState.processAcks) — NOT the raw received-packet count.
+   */
+  recordAck(acksProcessed: number, rttSample?: number): void {
+    if (acksProcessed > 0) {
+      this.ackCount += acksProcessed;
+      this.windowAcked += acksProcessed;
+    }
     if (rttSample !== undefined && rttSample > 0) {
       this.rttSamples.push(rttSample);
       if (this.rttSamples.length > this.RTT_WINDOW) {
         this.rttSamples.shift();
       }
     }
+  }
+
+  /**
+   * Record bytes received from peer — for goodput / receive-side throughput
+   * estimation. Independent of ACK accounting.
+   */
+  recordReceivedBytes(bytes: number): void {
+    this.windowBytesAcked += bytes;
   }
 
   /** Evaluate quality tier and bandwidth — call periodically */
@@ -548,7 +561,12 @@ class ChannelState {
     }
   }
 
-  processAcks(peerAckSeq: number, peerAckBitfield: number, now: number): { rttSample?: number } {
+  /**
+   * Apply a peer's piggyback ACK info against our pending-retransmit map.
+   * Returns the RTT sample (if any) and the count of pending packets cleared,
+   * which drives the congestion controller's loss-rate denominator.
+   */
+  processAcks(peerAckSeq: number, peerAckBitfield: number, now: number): { rttSample?: number; acksProcessed: number } {
     const toRemove: number[] = [];
     let rttSample: number | undefined;
     for (const [seq, pkt] of this.pending) {
@@ -566,7 +584,7 @@ class ChannelState {
       }
     }
     for (const seq of toRemove) this.pending.delete(seq);
-    return { rttSample };
+    return { rttSample, acksProcessed: toRemove.length };
   }
 
   getRetransmits(now: number): PendingPacket[] {
@@ -795,8 +813,9 @@ export class ARCnetSession {
     const now = Date.now();
 
     // Process piggyback ACKs (peer acknowledging our outgoing packets)
-    const { rttSample } = ch.processAcks(pkt.ackSeq, pkt.ackBitfield, now);
-    this.congestion.recordAck(rttSample, buf.byteLength);
+    const { rttSample, acksProcessed } = ch.processAcks(pkt.ackSeq, pkt.ackBitfield, now);
+    this.congestion.recordAck(acksProcessed, rttSample);
+    this.congestion.recordReceivedBytes(buf.byteLength);
 
     const results: Array<{ channel: Channel; payload: ArrayBuffer }> = [];
 
