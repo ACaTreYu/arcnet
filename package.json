@@ -13,7 +13,9 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "networking",
@@ -33,7 +35,8 @@
   },
   "homepage": "https://arcboundinteractive.com/arcbound.html",
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "vitest": "^4.1.4"
   }
 }
