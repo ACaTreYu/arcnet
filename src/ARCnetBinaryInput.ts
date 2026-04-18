@@ -16,6 +16,8 @@ export type WeaponType = 'laser' | 'missile' | 'bouncy' | 'grenade' | 'shrapnel'
 // ─── Magic bytes (must not collide with JSON '{' = 0x7B or state snapshot 0x01) ───
 export const BINARY_INPUT_TAG = 0xA1;
 export const BINARY_FIRE_TAG = 0xA2;
+/** Critical game event tag (JSON payload wrapped for ARCnet CRITICAL channel delivery). */
+export const CRITICAL_JSON_TAG = 0xA3;
 
 // ─── Weapon type → u8 mapping ───
 const WEAPON_TO_ID: Record<WeaponType, number> = {

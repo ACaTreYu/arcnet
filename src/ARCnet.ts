@@ -144,6 +144,43 @@ export function isARCnetPacket(data: ArrayBuffer | Buffer | Uint8Array): boolean
   return first === ARCNET_MAGIC;
 }
 
+// ─── Packet Coalescence ─────────────────────────────────────────
+//
+// Multiple ARCnet packets batched into one transport send to reduce
+// per-packet DTLS/SCTP overhead (~20-40 bytes per send).
+// Format: [0xAB magic][u16 len][packet...][u16 len][packet...]...
+//
+// arcnet ships decoders only; the encoder lives in the downstream
+// transport layer that owns the send path (e.g. the WebRTC DataChannel).
+
+/** Magic byte for coalesced/batched packet bundles. */
+export const ARCNET_BATCH_MAGIC = 0xAB;
+
+/** True when the buffer starts with the batch magic and is long enough to carry at least one length-prefixed packet. */
+export function isBatchedPacket(data: ArrayBuffer | Buffer | Uint8Array): boolean {
+  if (data.byteLength < 4) return false;
+  const first = data instanceof ArrayBuffer ? new Uint8Array(data)[0]
+    : (data as any)[0];
+  return first === ARCNET_BATCH_MAGIC;
+}
+
+/** Split a coalesced batch into individual packet buffers. Returns [data] when the input is not a batch. Truncated tails are discarded. */
+export function unbatchPackets(data: ArrayBuffer): ArrayBuffer[] {
+  const view = new DataView(data);
+  if (view.getUint8(0) !== ARCNET_BATCH_MAGIC) return [data];
+
+  const result: ArrayBuffer[] = [];
+  let offset = 1;
+  while (offset + 2 <= data.byteLength) {
+    const len = view.getUint16(offset, true);
+    offset += 2;
+    if (offset + len > data.byteLength) break;
+    result.push(data.slice(offset, offset + len));
+    offset += len;
+  }
+  return result;
+}
+
 // ─── FEC (Forward Error Correction) ─────────────────────────────
 //
 // XOR parity with explicit seq tagging. Every FEC_GROUP_SIZE data packets
@@ -896,3 +933,7 @@ export class ARCnetSession {
     this.stats.fecRecoveries = 0;
   }
 }
+
+// ─── Barrel re-export ───────────────────────────────────────────
+// Consumers get the binary input/fire codec from the same entry point.
+export * from './ARCnetBinaryInput';

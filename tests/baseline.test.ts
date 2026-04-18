@@ -10,12 +10,15 @@ import { describe, it, expect } from 'vitest';
 import {
   ARCNET_MAGIC,
   ARCNET_HEADER_SIZE,
+  ARCNET_BATCH_MAGIC,
   Channel,
   PacketFlags,
   QualityTier,
   encodePacket,
   decodePacket,
   isARCnetPacket,
+  isBatchedPacket,
+  unbatchPackets,
   ARCnetSession,
 } from '../src/ARCnet';
 
@@ -27,6 +30,9 @@ describe('constants', () => {
   });
   it('header size is 10 bytes (post Step 1)', () => {
     expect(ARCNET_HEADER_SIZE).toBe(10);
+  });
+  it('batch magic is 0xAB', () => {
+    expect(ARCNET_BATCH_MAGIC).toBe(0xAB);
   });
 });
 
@@ -100,6 +106,36 @@ describe('packet detection helpers', () => {
     expect(isARCnetPacket(encoded)).toBe(true);
   });
 
+  it('isBatchedPacket false on framed ARCnet packet', () => {
+    const encoded = encodePacket({
+      channel: Channel.RELIABLE,
+      flags: PacketFlags.NORMAL,
+      sequence: 0,
+      ackSeq: 0,
+      ackBitfield: 0,
+      payload: new ArrayBuffer(0),
+    });
+    expect(isBatchedPacket(encoded)).toBe(false);
+  });
+
+  it('isBatchedPacket + unbatchPackets round-trip two packets', () => {
+    const p1 = new Uint8Array([1, 2, 3]).buffer;
+    const p2 = new Uint8Array([4, 5, 6, 7]).buffer;
+    const totalLen = 1 + 2 + p1.byteLength + 2 + p2.byteLength;
+    const batch = new ArrayBuffer(totalLen);
+    const view = new DataView(batch);
+    view.setUint8(0, ARCNET_BATCH_MAGIC);
+    view.setUint16(1, p1.byteLength, true);
+    new Uint8Array(batch, 3, p1.byteLength).set(new Uint8Array(p1));
+    view.setUint16(3 + p1.byteLength, p2.byteLength, true);
+    new Uint8Array(batch, 3 + p1.byteLength + 2, p2.byteLength).set(new Uint8Array(p2));
+
+    expect(isBatchedPacket(batch)).toBe(true);
+    const unbatched = unbatchPackets(batch);
+    expect(unbatched).toHaveLength(2);
+    expect(new Uint8Array(unbatched[0])).toEqual(new Uint8Array(p1));
+    expect(new Uint8Array(unbatched[1])).toEqual(new Uint8Array(p2));
+  });
 });
 
 // ─── End-to-end session happy path ─────────────────────────────────
