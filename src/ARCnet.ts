@@ -934,6 +934,7 @@ export class ARCnetSession {
   }
 }
 
-// ─── Barrel re-export ───────────────────────────────────────────
-// Consumers get the binary input/fire codec from the same entry point.
-export * from './ARCnetBinaryInput';
+// Binary input/fire codec lives in its own module so consumers import it
+// directly (`from 'arcnet/dist/ARCnetBinaryInput'`). A top-level barrel
+// re-export here hid the symbols behind Object.defineProperty calls in the
+// CJS output that Rollup's static analyzer could not trace.
