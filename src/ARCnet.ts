@@ -316,9 +316,9 @@ class CongestionController {
   private windowSent = 0;
   private windowAcked = 0;
 
-  // RTT tracking
+  // RTT tracking — larger window lets p95/p99 have meaningful resolution.
   private rttSamples: number[] = [];
-  private readonly RTT_WINDOW = 20;
+  private readonly RTT_WINDOW = 50;
   private rttTrend: number = 0; // positive = rising (bad), negative = falling (good)
 
   // Bandwidth estimation
@@ -444,6 +444,25 @@ class CongestionController {
   get goodputBps(): number { return this._goodputBps; }
   /** Recommended snapshot interval in ms (30-90, continuously adaptive) */
   get snapshotInterval(): number { return this._snapshotInterval; }
+
+  /**
+   * Nearest-rank RTT percentile over the current sample ring.
+   * p ∈ [0, 1]; returns 0 when no samples have been recorded. A p of 0.95
+   * returns the smallest sample that is greater-than-or-equal-to 95% of the
+   * ring, i.e. the 95th-percentile tail latency.
+   */
+  rttPercentile(p: number): number {
+    const n = this.rttSamples.length;
+    if (n === 0) return 0;
+    const sorted = [...this.rttSamples].sort((a, b) => a - b);
+    const clampedP = Math.max(0, Math.min(1, p));
+    const rank = Math.max(0, Math.min(n - 1, Math.ceil(clampedP * n) - 1));
+    return sorted[rank];
+  }
+
+  get rttP50(): number { return this.rttPercentile(0.5); }
+  get rttP95(): number { return this.rttPercentile(0.95); }
+  get rttP99(): number { return this.rttPercentile(0.99); }
 
   reset(): void {
     this.sentCount = 0;
@@ -678,6 +697,12 @@ export interface ARCnetStats {
   goodputBps: number;
   /** Recommended snapshot interval in ms (30-90, continuously adaptive) */
   snapshotInterval: number;
+  /** Median RTT across the sample ring, in ms (0 if no samples). */
+  rttP50: number;
+  /** 95th-percentile RTT, in ms — jitter / tail latency signal for mobile links. */
+  rttP95: number;
+  /** 99th-percentile RTT, in ms. */
+  rttP99: number;
 }
 
 /** Optional configuration for an ARCnetSession. */
@@ -702,6 +727,7 @@ export class ARCnetSession {
     retransmits: 0, bytesSent: 0, bytesReceived: 0,
     lossRate: 0, quality: QualityTier.GOOD, fecRecoveries: 0,
     estimatedBandwidth: 50000, goodputBps: 0, snapshotInterval: 30,
+    rttP50: 0, rttP95: 0, rttP99: 0,
   };
 
   constructor(options?: ARCnetSessionOptions) {
@@ -852,6 +878,9 @@ export class ARCnetSession {
     this.stats.estimatedBandwidth = this.congestion.estimatedBandwidth;
     this.stats.goodputBps = this.congestion.goodputBps;
     this.stats.snapshotInterval = this.congestion.snapshotInterval;
+    this.stats.rttP50 = this.congestion.rttP50;
+    this.stats.rttP95 = this.congestion.rttP95;
+    this.stats.rttP99 = this.congestion.rttP99;
 
     return result;
   }
