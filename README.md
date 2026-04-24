@@ -15,6 +15,7 @@ Built for and battle-tested in the [Arcbound game](https://arcboundinteractive.c
 | Bursty loss | XOR-based forward error correction (one recovery packet per N data packets) |
 | Congestion | Loss/RTT monitoring → `GOOD`/`FAIR`/`POOR` quality tier callers can throttle on |
 | Channel contention | Separate sequence spaces per channel (critical, reliable, sequenced, volatile) |
+| Small-packet overhead | Optional per-tick **batching** — multiple packets fused under `ARCNET_BATCH_MAGIC` (0xAB) and split on the receive side via `unbatchPackets()` |
 
 ## Packet format
 
@@ -44,8 +45,14 @@ Seq tags make recovery wrap-safe and let the receiver deliver the recovered pack
 
 ## Files
 
-- `src/ARCnet.ts` — the core protocol (sequencing, ACKs, retransmit, FEC, congestion control)
+- `src/ARCnet.ts` — the core protocol (sequencing, ACKs, retransmit, FEC, batching, congestion control)
 - `src/ARCnetBinaryInput.ts` — compact binary encoding for game input packets (80–85% size reduction vs JSON). Included as a demonstration of a packed application-level codec riding on top of ARCnet.
+
+The core protocol is the package's main entry (`import { ARCnetSession } from 'arcnet'`). The binary codec is not re-exported from the root — import it directly from its subpath when you need it:
+
+```ts
+import { encodeBinaryInput, decodeBinaryInput } from 'arcnet/dist/ARCnetBinaryInput';
+```
 
 ## Usage
 
@@ -81,6 +88,9 @@ if (session.getQuality() === QualityTier.POOR) throttleSnapshots();
 
 // Or use the continuously adaptive snapshot interval:
 const intervalMs = session.getStats().snapshotInterval; // 30–90 ms
+
+// RTT percentiles for jitter / tail-latency signals (populated after a few samples):
+const { rttP50, rttP95, rttP99 } = session.getStats();
 ```
 
 Optional config — enable FEC per channel. Defaults: `[CRITICAL=false, RELIABLE=true, SEQUENCED=true, VOLATILE=false]`.
@@ -95,14 +105,14 @@ const session = new ARCnetSession({ fec: [true, true, true, false] });
 
 ```bash
 npm install
-npm run build       # emits dist/ via tsc
-npm test            # vitest run — round-trip, FEC, wrap, congestion
+npm run build       # emits dist/ via tsc (CommonJS — works for both ESM `import` and CJS `require()` consumers)
+npm test            # vitest run — round-trip, FEC, wrap, congestion, percentiles
 npm run typecheck   # tsc --noEmit
 ```
 
 ## Status
 
-- **v3** — FEC (seq-tagged, length-prefixed), adaptive snapshot interval, wrap-safe header v1 (Apr 2026)
+- **v3** — FEC (seq-tagged, length-prefixed), adaptive snapshot interval, wrap-safe header v1, RTT percentile stats (p50/p95/p99), packet batching + `unbatchPackets`, CommonJS build for Node consumers (Apr 2026)
 - v2 — UDP protocol, snapshot interpolation
 - v1 — basic framing + ACKs
 
